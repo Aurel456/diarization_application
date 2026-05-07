@@ -1148,11 +1148,44 @@ def main() -> None:
 
     handler: Optional[StreamlitLogHandler] = None
 
+    # The diarization step ships sub-progress from worker threads
+    # (ThreadPoolExecutor in run_diarization). Streamlit rejects UI updates
+    # from threads without a ScriptRunContext — emitting a "missing
+    # ScriptRunContext!" warning and silently dropping the update. We
+    # capture the main script's context here and attach it on first use
+    # from each worker thread so progress updates land on the UI.
+    try:
+        from streamlit.runtime.scriptrunner import (
+            add_script_run_ctx as _add_ctx,
+            get_script_run_ctx as _get_ctx,
+        )
+        _main_ctx = _get_ctx()
+    except Exception:
+        _add_ctx = None
+        _main_ctx = None
+
+    def _ensure_streamlit_ctx() -> None:
+        if _add_ctx is None or _main_ctx is None:
+            return
+        cur = threading.current_thread()
+        if getattr(cur, "_diarization_ctx_attached", False):
+            return
+        try:
+            _add_ctx(cur, _main_ctx)
+            cur._diarization_ctx_attached = True  # type: ignore[attr-defined]
+        except Exception:
+            # Don't let UI plumbing crash a worker — just skip the update.
+            pass
+
     def progress_callback(
         step: str, status: str, message: str, payload: Optional[Dict] = None
     ) -> None:
         if step not in PIPELINE_STEP_SEQUENCE:
             return
+
+        # First-time attach for any worker thread that calls us.
+        _ensure_streamlit_ctx()
+
         st.session_state["step_status"][step] = status
         completed_steps = [
             s
@@ -1175,11 +1208,16 @@ def main() -> None:
             fractional = max(0.0, min(1.0, payload["completed"] / payload["total"]))
 
         progress = (len(completed_steps) + fractional) / total_steps
-        progress_placeholder.progress(min(progress, 1.0))
-        status_placeholder.markdown(
-            f"**{PIPELINE_STEP_LABELS.get(step, step)}** : {message}",
-            unsafe_allow_html=True,
-        )
+        try:
+            progress_placeholder.progress(min(progress, 1.0))
+            status_placeholder.markdown(
+                f"**{PIPELINE_STEP_LABELS.get(step, step)}** : {message}",
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            # If a worker still can't reach the UI (older Streamlit, no ctx),
+            # swallow rather than crash the pipeline.
+            pass
 
     # --- LOGIQUE D'EXÉCUTION ---
     if run_button and not st.session_state["pipeline_running"]:
