@@ -179,16 +179,25 @@ def cluster_speakers(data: pd.DataFrame, device: torch.device, chunks_folder: st
         data['_clean'] = True
 
     try:
-        # Per (chunk, speaker): prefer clean + long segments
-        def _pick_top(group: pd.DataFrame) -> pd.DataFrame:
-            return group.sort_values(
-                ['_clean', 'segment_duration'], ascending=[False, False]
-            ).head(rep_segments_top_k)
-
+        # Per (chunk, speaker): prefer clean + long segments.
+        #
+        # Earlier this was implemented via groupby(...).apply(_pick_top), but
+        # pandas 2.2+ (and 3.x by default) drops the groupby key columns from
+        # the apply result when `include_groups` flips to False. That stripped
+        # 'chunks' and 'speaker' from rep_segments and broke
+        # compute_embeddings_batch downstream with KeyError: 'chunks'.
+        #
+        # Sorting once and using groupby(...).head(k) avoids apply() entirely;
+        # `.head()` is a filter operation that keeps every column of the
+        # source DataFrame (group keys included), so the result is stable
+        # across pandas versions.
         rep_segments = (
-            data.groupby(['chunks', 'speaker'], group_keys=False)
-                .apply(_pick_top)
-                .copy()
+            data.sort_values(
+                ['_clean', 'segment_duration'], ascending=[False, False]
+            )
+            .groupby(['chunks', 'speaker'], sort=False)
+            .head(rep_segments_top_k)
+            .copy()
         )
         logging.info(f"Selected {len(rep_segments)} segments for embedding.")
     except Exception as e:
