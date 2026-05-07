@@ -1,0 +1,20 @@
+ROOT=YOUR_FOLDER/data
+INPUT_AUDIO='["audio - Partie 1 sur 4.qt","audio - Partie 2 sur 4.qt","audio - Partie 3 sur 4.qt","audio - Partie 4 sur 4.qt"]'
+# 'sequential': Files in INPUT_AUDIO are treated as consecutive parts of a single recording. Timestamps will be shifted.
+# 'concurrent': Files are treated as separate recordings starting at time 0 (default behavior).
+AUDIO_PROCESSING_MODE="sequential"
+SEGMENT_DURATION=1200
+MAX_WORKERS=2
+DUREE_MIN_SPEAKER=0.5
+HF_TOKEN=None
+# None or hf_your_key
+
+# === SERVER (single endpoint for Whisper + LLM) ===
+SERVER_URL=http://server:30333/v1
+API_KEY=your_API_KEY
+
+WHISPER_MODEL=/model/whisper
+VAD_FILTER=True
+
+# === LLM (uses SERVER_URL — no separate URL anymore) ===
+LLM_MODEL=

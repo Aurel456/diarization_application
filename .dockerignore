@@ -1,0 +1,64 @@
+# --- Build / VCS ---
+.git
+.gitignore
+.dockerignore
+
+# --- IDE / editor temp files (the *.tmp.NNNN.NNNN VS Code atomic-write files) ---
+*.tmp.*
+*.swp
+*.swo
+.vscode
+.idea
+
+# --- Python ---
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# --- Audio / data (NEVER ship into the image) ---
+*.mp3
+*.mp4
+*.mov
+*.wav
+*.m4a
+*.flac
+*.mkv
+input_audio
+CSAR*
+
+# --- Pipeline outputs / caches (shouldn't exist in built image) ---
+experiments
+saved_state
+api_uploads
+tmp
+audio_uploads_*
+
+# --- Generated docs / reports ---
+*.docx
+*.csv
+
+# --- Virtualenvs ---
+venv
+.venv
+env
+
+# --- Models: mount as a volume, don't COPY into the image (~100s MB) ---
+model_storage
+
+# --- Local secrets (use docker-compose env_file or k8s secrets) ---
+.env
+.env.development
+.env.production
+.env*.local
+
+# --- Notebooks / scratch ---
+*.ipynb
+notebooks_test
+test.py
+tests

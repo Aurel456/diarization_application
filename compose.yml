@@ -1,0 +1,66 @@
+# ============================================================================
+# Stateless Docker deployment.
+#
+# Persistance : SEUL le volume `model_storage` (modèles Pyannote, ~700 MB) est
+# monté en read-only. Tout le reste (cache pickle, experiments, uploads, logs)
+# est éphémère et part avec le conteneur. Un redémarrage = repartir de zéro.
+#
+# Lancement :
+#   docker compose up -d streamlit          # UI Streamlit  (port 8501 → 3016)
+#   docker compose up -d api                # API FastAPI    (port 8000 → 3017)
+#   docker compose --profile gpu up -d ...  # avec GPU NVIDIA
+# ============================================================================
+
+x-stateless-env: &stateless_env
+  APP_STATELESS: "true"
+  APP_ENV: "production"
+  APP_LOG_TO_CONSOLE: "true"
+  PYTHONUNBUFFERED: "1"
+
+services:
+  streamlit:
+    build: .
+    image: diarization-app:latest
+    restart: unless-stopped
+    ports:
+      - "3016:8501"
+    environment:
+      <<: *stateless_env
+    env_file:
+      - .env       # SERVER_URL, API_KEY, LLM_BASE_URL… (gardés hors image)
+    volumes:
+      - ./model_storage:/app/model_storage:ro   # modèles Pyannote (read-only)
+    # Décommenter pour activer le GPU NVIDIA (driver nvidia-container-toolkit requis)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  api:
+    build: .
+    image: diarization-app:latest
+    restart: unless-stopped
+    command: ["python", "run.py", "--serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "3017:8000"
+    environment:
+      <<: *stateless_env
+    env_file:
+      - .env
+    volumes:
+      - ./model_storage:/app/model_storage:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,58 @@
+# --- Audio / video data ---
+*.mp3
+*.mov
+*.mp4
+*.wav
+*.m4a
+*.flac
+*.mkv
+
+*.zip
+.claude/
+.ruff_cache/
+
+# --- Generated reports ---
+*.docx
+*.csv
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# --- IDE atomic-write temp files (VS Code: file.py.tmp.NNNN.NNNN) ---
+*.tmp.*
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# --- Local env / secrets ---
+.env
+.env.local
+.env*.local
+
+# --- Tests / scratch ---
+test.py
+test/
+test.ipynb
+notebooks_test/
+
+# --- Heavy data dirs (never commit) ---
+input_audio/
+model_storage/
+
+# --- Pipeline runtime outputs (everything ephemeral lives here) ---
+experiments/
+saved_state/
+api_uploads/
+tmp/
+audio_uploads_*
+
+# --- Virtualenvs ---
+venv/
+.venv/
+env/
