@@ -1061,6 +1061,7 @@ def run_pipeline(
         updated_data_results = load_or_run(
             update_speaker_labels,
             args=(diarization_df, mapping_hdbscan, diarization_results_run),
+            kwargs={"segment_duration": config.segment_duration},
             pickle_path=updated_data_pickle,
             description="Speaker Label Update",
         )

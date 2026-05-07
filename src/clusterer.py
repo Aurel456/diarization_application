@@ -136,7 +136,18 @@ def cluster_speakers(data: pd.DataFrame, device: torch.device, chunks_folder: st
     back to AgglomerativeClustering with a clamped count if the result is
     outside the requested range.
     """
-    
+
+    # Defensive guard: stale pickles from earlier code versions may lack
+    # the 'chunks' column (added later). Recompute it on the fly so all
+    # downstream groupby('chunks') calls succeed.
+    if 'chunks' not in data.columns and 'start' in data.columns:
+        logging.warning(
+            "Input DataFrame is missing the 'chunks' column. "
+            "Recomputing from 'start' (segment_duration=%ss).", segment_duration
+        )
+        data = data.copy()
+        data['chunks'] = (data['start'] // segment_duration).astype(int)
+
     logging.info(f"Selecting top {rep_segments_top_k} representative segments per speaker-chunk.")
     if 'segment_duration' not in data.columns:
         data['segment_duration'] = data['finish'] - data['start']
@@ -424,15 +435,31 @@ def cluster_speakers(data: pd.DataFrame, device: torch.device, chunks_folder: st
 
 
 def update_speaker_labels(data: pd.DataFrame, mapping_hdbscan: Dict[Tuple[int, str], int],
-                          diarization_output_dir: str) -> Tuple[pd.DataFrame, str]:
+                          diarization_output_dir: str,
+                          segment_duration: Optional[int] = None) -> Tuple[pd.DataFrame, str]:
     """
     Updates speaker labels in the DataFrame based on clustering results.
     (This function remains unchanged as it operates on the DataFrame results, not the model)
     """
     logging.info("Updating speaker labels based on clustering map.")
 
+    # Defensive guard for stale pickles missing 'chunks'. We try to recover
+    # from 'start' if segment_duration is provided; otherwise fall back to
+    # using only the speaker key (less precise but never crashes).
+    has_chunks_col = 'chunks' in data.columns
+    if not has_chunks_col and 'start' in data.columns and segment_duration:
+        logging.warning(
+            "DataFrame missing 'chunks' column — recomputing from 'start'."
+        )
+        data = data.copy()
+        data['chunks'] = (data['start'] // segment_duration).astype(int)
+        has_chunks_col = True
+
     def get_global_speaker(row):
-        cluster_id = mapping_hdbscan.get((row['chunks'], row['speaker']), -1)
+        # Default to 0 if 'chunks' is somehow absent — prevents KeyError;
+        # the speaker column is still consulted.
+        chunk_key = row['chunks'] if has_chunks_col else 0
+        cluster_id = mapping_hdbscan.get((chunk_key, row['speaker']), -1)
         if cluster_id == -1:
             return "Noise"
         else:

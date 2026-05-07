@@ -1434,12 +1434,18 @@ def main() -> None:
             progress_placeholder.progress(1.0)
 
         except Exception as e:
-            # Capture de l'erreur pour affichage persistant
-            error_msg = str(e)
+            # Capture de l'erreur pour affichage persistant. We include the
+            # exception type and a short traceback tail so opaque errors
+            # (e.g. `KeyError: 'chunks'`) surface their actual location
+            # instead of just a single key name.
+            import traceback as _tb
+            tb_str = _tb.format_exc()
+            error_msg = f"{type(e).__name__}: {e}"
             print(f"[STREAMLIT] CRITICAL ERROR: {error_msg}")
+            print(tb_str)
             logging.error("Pipeline crash", exc_info=True)
 
-            st.session_state["pipeline_error"] = error_msg
+            st.session_state["pipeline_error"] = f"{error_msg}\n\n{tb_str}"
             # Sauvegarde des messages de logs courants pour analyse
             if handler:
                 st.session_state["pipeline_crash_logs"] = handler.messages.copy()
