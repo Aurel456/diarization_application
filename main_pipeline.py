@@ -911,6 +911,23 @@ def run_pipeline(
         if not config.reuse_cache and os.path.exists(diarization_pickle):
             os.remove(diarization_pickle)
 
+        # Bridge run_diarization's chunk-level progress (and pyannote's
+        # internal sub-step name) into the existing notify() stream so the
+        # Streamlit bar fills smoothly during a long diarization instead of
+        # staying at 0% until the step completes.
+        def _diarization_progress(
+            done: int, total: int, sub_step: Optional[str]
+        ) -> None:
+            label = f"Diarization · {done}/{total} chunks"
+            if sub_step:
+                label = f"{label} · {sub_step}"
+            notify(
+                "diarization",
+                "in_progress",
+                label,
+                {"completed": done, "total": total, "sub_step": sub_step},
+            )
+
         merged_diarization_path = load_or_run(
             run_diarization,
             args=(
@@ -921,6 +938,7 @@ def run_pipeline(
                 config.segment_duration,
                 config.max_workers,
             ),
+            kwargs={"progress_callback": _diarization_progress},
             pickle_path=diarization_pickle,
             description="Chunk Diarization",
         )

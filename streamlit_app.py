@@ -1159,12 +1159,23 @@ def main() -> None:
             for s in PIPELINE_STEP_SEQUENCE
             if st.session_state["step_status"].get(s) in {"success", "skipped"}
         ]
-        progress = (
-            len(completed_steps) / len(PIPELINE_STEP_SEQUENCE)
-            if PIPELINE_STEP_SEQUENCE
-            else 0
-        )
-        progress_placeholder.progress(progress)
+        total_steps = len(PIPELINE_STEP_SEQUENCE) or 1
+
+        # If the current step ships fractional sub-progress (diarization
+        # streams chunk completions), credit a partial slice of that step
+        # so the bar moves during long stages instead of jumping per step.
+        fractional = 0.0
+        if (
+            status == "in_progress"
+            and payload
+            and isinstance(payload.get("total"), int)
+            and payload["total"] > 0
+            and isinstance(payload.get("completed"), int)
+        ):
+            fractional = max(0.0, min(1.0, payload["completed"] / payload["total"]))
+
+        progress = (len(completed_steps) + fractional) / total_steps
+        progress_placeholder.progress(min(progress, 1.0))
         status_placeholder.markdown(
             f"**{PIPELINE_STEP_LABELS.get(step, step)}** : {message}",
             unsafe_allow_html=True,

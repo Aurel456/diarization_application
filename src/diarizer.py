@@ -1,27 +1,80 @@
-# src/diarizer.py 
+# src/diarizer.py
 import os
+import threading
 import torch
 from pyannote.audio import Pipeline
 import pyannote.audio
 # print("pyannote.audio.__version__ :" , pyannote.audio.__version__)
 # from pydub import AudioSegment
 import concurrent.futures
-from tqdm import tqdm
 import glob
 import pandas as pd
 import logging
 import time
 # import numpy as np
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Any, Callable, Dict, List, Mapping, Optional, Text, Tuple
 from pathlib import Path
 
-def process_chunk_diarization(file_path: str, pipeline: Pipeline, device: torch.device,
-                             segment_duration: int, output_dir: str) -> Optional[str]:
+
+# ---------------------------------------------------------------------------
+# Progress projection — pyannote internal hook → external callback
+# ---------------------------------------------------------------------------
+
+class _SubStepRelayHook:
+    """
+    Pyannote-compatible hook that forwards the current internal step name
+    (speaker_counting, embeddings, discrete_diarization, …) to an external
+    callable. We intentionally don't expose pyannote's per-step (completed,
+    total) counters — multiple chunks run in parallel via ThreadPoolExecutor
+    so a single shared bar would race; the chunk-level bar is the source of
+    truth for progress, and the sub-step name is shown as a label only.
+    """
+
+    def __init__(
+        self, on_step: Callable[[str], None], chunk_label: str = ""
+    ) -> None:
+        self._on_step = on_step
+        self._chunk_label = chunk_label
+
+    def __enter__(self) -> "_SubStepRelayHook":
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def __call__(
+        self,
+        step_name: Text,
+        step_artifact: Any,
+        file: Optional[Mapping] = None,
+        total: Optional[int] = None,
+        completed: Optional[int] = None,
+    ) -> None:
+        try:
+            self._on_step(str(step_name))
+        except Exception:
+            # Never let UI plumbing crash the pipeline.
+            pass
+
+
+def process_chunk_diarization(
+    file_path: str,
+    pipeline: Pipeline,
+    device: torch.device,
+    segment_duration: int,
+    output_dir: str,
+    on_sub_step: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
     """
     Processes one audio chunk file for speaker diarization.
+
+    Args:
+        on_sub_step: Optional callable receiving pyannote's internal step
+                     name (e.g. "embeddings", "clustering"). Used to surface
+                     a textual indicator alongside the chunk-level bar.
     """
     base_name = os.path.splitext(os.path.basename(file_path))[0]
-    
+
     # --- MODIFICATION 1: Create a unique and informative file ID ---
     # This combines the parent directory name (the base audio name) and the chunk name.
     # e.g., "CSAR 070725 - Partie 1 sur 4___out000"
@@ -46,7 +99,11 @@ def process_chunk_diarization(file_path: str, pipeline: Pipeline, device: torch.
 
     try:
         logging.debug(f"Diarizing chunk: {file_path}")
-        diarization = pipeline(audio_data)
+        if on_sub_step is not None:
+            with _SubStepRelayHook(on_sub_step, chunk_label=base_name) as hook:
+                diarization = pipeline(audio_data, hook=hook)
+        else:
+            diarization = pipeline(audio_data)
 
         formatted_output = ""
         for turn, speaker in diarization.speaker_diarization:
@@ -65,10 +122,26 @@ def process_chunk_diarization(file_path: str, pipeline: Pipeline, device: torch.
         return None
 
 
-def run_diarization(device: torch.device, chunks_folder: str, diarization_results_dir: str,
-                    hf_token: str, segment_duration: int, max_workers: int = 2) -> str:
+def run_diarization(
+    device: torch.device,
+    chunks_folder: str,
+    diarization_results_dir: str,
+    hf_token: str,
+    segment_duration: int,
+    max_workers: int = 2,
+    progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
+) -> str:
     """
     Runs speaker diarization on all audio chunks in parallel and merges the results.
+
+    Args:
+        progress_callback: Optional callable(done, total, sub_step) invoked
+                           after every chunk completes AND on each pyannote
+                           internal sub-step. `done`/`total` track chunk
+                           completion (authoritative); `sub_step` is the
+                           current pyannote internal step name (e.g.
+                           "embeddings") used as a UI label only — None when
+                           the call is purely a chunk-completion event.
     """
     if not os.path.exists(diarization_results_dir):
         os.makedirs(diarization_results_dir)
@@ -88,16 +161,49 @@ def run_diarization(device: torch.device, chunks_folder: str, diarization_result
         logging.error(f"No audio chunks found in {chunks_folder}. Aborting diarization.")
         raise FileNotFoundError(f"No chunks found in {chunks_folder}")
 
-    logging.info(f"Found {len(audio_files)} audio chunks. Starting diarization with {max_workers} workers...")
+    total_chunks = len(audio_files)
+    logging.info(f"Found {total_chunks} audio chunks. Starting diarization with {max_workers} workers...")
 
     start_time = time.time()
-    processed_files_paths = []
+    processed_files_paths: List[str] = []
+
+    # Shared state for progress projection. `done` is mutated under the lock.
+    progress_lock = threading.Lock()
+    progress_state = {"done": 0}
+
+    def _emit(sub_step: Optional[str]) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(progress_state["done"], total_chunks, sub_step)
+        except Exception:
+            # UI plumbing must never crash diarization.
+            pass
+
+    # Initial 0% emission so the bar is visible immediately.
+    _emit(None)
+
+    def _on_sub_step(step_name: str) -> None:
+        # Several worker threads may emit concurrently. Only forwarding the
+        # latest step name is fine for a UI label — the chunk-level counters
+        # remain authoritative for progress.
+        _emit(step_name)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_chunk_diarization, file_path, pipeline, device, segment_duration, diarization_results_dir): file_path
-                   for file_path in audio_files}
+        futures = {
+            executor.submit(
+                process_chunk_diarization,
+                file_path,
+                pipeline,
+                device,
+                segment_duration,
+                diarization_results_dir,
+                _on_sub_step,
+            ): file_path
+            for file_path in audio_files
+        }
 
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Diarizing Chunks"):
+        for future in concurrent.futures.as_completed(futures):
             file_path = futures[future]
             try:
                 result_path = future.result()
@@ -107,6 +213,10 @@ def run_diarization(device: torch.device, chunks_folder: str, diarization_result
                     logging.warning(f"Chunk diarization failed for: {file_path}")
             except Exception as exc:
                 logging.error(f'Chunk {file_path} generated an exception: {exc}', exc_info=True)
+            finally:
+                with progress_lock:
+                    progress_state["done"] += 1
+                _emit(None)
 
     processed_files_paths.sort()
 
