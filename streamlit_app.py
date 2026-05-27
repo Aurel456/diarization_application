@@ -385,8 +385,48 @@ def render_health_check_sidebar(server_url: str, llm_url: Optional[str], api_key
 
         if s.ok and s.available_models:
             with st.expander(f"Modèles disponibles ({s.name})", expanded=False):
-                for m in s.available_models:
-                    st.code(m, language=None)
+                # Map service name → (sidebar session_state key, .env default).
+                # Picking here updates the sidebar; .env model is the default.
+                _service_config = {
+                    "Whisper": ("whisper_model", settings.whisper_model),
+                    "LLM": ("llm_model", settings.llm_model),
+                }
+                service_cfg = _service_config.get(s.name)
+
+                if service_cfg is None:
+                    # Unknown service — keep the legacy read-only display.
+                    for m in s.available_models:
+                        st.code(m, language=None)
+                else:
+                    sidebar_key, env_default = service_cfg
+                    expander_key = f"expander_{sidebar_key}"
+
+                    # Seed order: sidebar pick → .env value → first available.
+                    # Picks .env model by default so the index matches what's
+                    # configured, even before the user touches the sidebar.
+                    if expander_key not in st.session_state:
+                        current = st.session_state.get(sidebar_key) or env_default
+                        st.session_state[expander_key] = (
+                            current
+                            if current in s.available_models
+                            else s.available_models[0]
+                        )
+
+                    def _sync_to_sidebar(exp_k=expander_key, side_k=sidebar_key):
+                        # Callback runs before the next render, so writing to
+                        # the sidebar key here is safe — the sidebar widget
+                        # will pick it up when it instantiates.
+                        st.session_state[side_k] = st.session_state[exp_k]
+
+                    st.selectbox(
+                        "Sélectionne le modèle à utiliser",
+                        options=s.available_models,
+                        key=expander_key,
+                        on_change=_sync_to_sidebar,
+                    )
+                    st.caption(
+                        f"Modèle actif : `{st.session_state.get(sidebar_key, '—')}`"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -453,12 +493,20 @@ def model_selectbox(
         options = [current_value] + options
     options = options + [MANUAL]
 
-    default_idx = (
-        options.index(current_value)
-        if current_value and current_value in options
-        else 0
-    )
-    choice = st.selectbox(label, options=options, index=default_idx, key=key, help=help)
+    # IMPORTANT: never pass `index` together with `key` — Streamlit's `index`
+    # arg keeps overriding the user's pick on every rerun, so the selectbox
+    # looks frozen. Seed session_state once instead, then let `key` own it.
+    if key not in st.session_state:
+        st.session_state[key] = (
+            current_value if current_value and current_value in options else options[0]
+        )
+    elif st.session_state[key] not in options:
+        # Available model list changed and the previously picked id vanished.
+        st.session_state[key] = (
+            current_value if current_value and current_value in options else options[0]
+        )
+
+    choice = st.selectbox(label, options=options, key=key, help=help)
     if choice == MANUAL:
         return st.text_input(
             f"{label} — saisie libre",
@@ -1489,6 +1537,7 @@ def main() -> None:
                             "Batch_Results.zip",
                             "application/zip",
                             use_container_width=True,
+                            help="Télécharger tous les résultats dans un fichier ZIP"
                         )
                 else:
                     st.warning("Le fichier ZIP n'a pas pu être généré.")
