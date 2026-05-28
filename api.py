@@ -9,12 +9,12 @@ import logging
 import shutil
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import asdict
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, status, Form
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -25,6 +25,7 @@ from main_pipeline import (
     PipelineResult,
 )
 from settings import settings
+from src.health_check import check_all_services
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -114,7 +115,7 @@ def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, 
                 {
                     "status": "completed",
                     "result": result_dict,
-                    "completed_at": datetime.utcnow().isoformat(),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
@@ -135,7 +136,7 @@ def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, 
                 {
                     "status": final_status,
                     "message": str(e),
-                    "completed_at": datetime.utcnow().isoformat(),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
     finally:
@@ -163,9 +164,18 @@ def root():
 async def transcribe_audio(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    run_id: Optional[str] = None,
-    enable_speaker_identification: Optional[bool] = None,
-    enable_meeting_minutes: Optional[bool] = None,
+    run_id: Optional[str] = Form(None),
+    enable_speaker_identification: Optional[bool] = Form(None),
+    enable_meeting_minutes: Optional[bool] = Form(None),
+    segment_duration: Optional[int] = Form(None),
+    max_workers: Optional[int] = Form(None),
+    enable_llm_cleaning: Optional[bool] = Form(None),
+    enable_summary: Optional[bool] = Form(None),
+    num_speakers: Optional[int] = Form(None),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+    meeting_minutes_format: Optional[str] = Form(None),
+    whisper_model: Optional[str] = Form(None),
 ):
     """
     Upload an audio file and start transcription/diarization pipeline.
@@ -204,7 +214,7 @@ async def transcribe_audio(
         jobs[job_id] = {
             "job_id": job_id,
             "status": "queued",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "audio_path": str(audio_path),
             "original_filename": file.filename,
         }
@@ -214,6 +224,15 @@ async def transcribe_audio(
         "run_id": run_id,
         "enable_speaker_identification": enable_speaker_identification,
         "enable_meeting_minutes": enable_meeting_minutes,
+        "segment_duration": segment_duration,
+        "max_workers": max_workers,
+        "enable_llm_cleaning": enable_llm_cleaning,
+        "enable_summary": enable_summary,
+        "num_speakers": num_speakers,
+        "min_speakers": min_speakers,
+        "max_speakers": max_speakers,
+        "meeting_minutes_format": meeting_minutes_format,
+        "whisper_model": whisper_model,
     }
 
     background_tasks.add_task(
@@ -327,7 +346,55 @@ def cleanup_job(job_id: str):
     return {"message": f"Job {job_id} cleaned up"}
 
 
+@app.get("/api/v1/jobs")
+def list_jobs(status: Optional[str] = None):
+    """
+    List all jobs, optionally filtered by status.
+
+    status: queued | processing | completed | failed | cancelled
+    """
+    with jobs_lock:
+        all_jobs = list(jobs.values())
+
+    if status:
+        all_jobs = [j for j in all_jobs if j["status"] == status]
+
+    all_jobs.sort(key=lambda x: x["created_at"], reverse=True)
+    return {
+        "total": len(all_jobs),
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "status": j["status"],
+                "original_filename": j.get("original_filename"),
+                "created_at": j["created_at"],
+                "completed_at": j.get("completed_at"),
+            }
+            for j in all_jobs
+        ],
+    }
+
+
 # Health check
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    """Liveness probe — always returns 200 if the API process is up."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/health/services")
+def health_services():
+    """Check upstream service availability (Whisper + LLM). May be slow (~10s timeout)."""
+    statuses = check_all_services(
+        server_url=settings.server_url,
+        llm_base_url=settings.llm_base_url,
+        api_key=settings.api_key,
+        whisper_model=settings.whisper_model,
+        llm_model=settings.llm_model,
+    )
+    all_ok = all(s.ok for s in statuses)
+    return {
+        "status": "healthy" if all_ok else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": [asdict(s) for s in statuses],
+    }
