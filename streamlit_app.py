@@ -9,7 +9,7 @@ import time
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import streamlit as st
@@ -39,6 +39,21 @@ from src.meeting_minutes import (
 from src.health_check import check_all_services, ServiceStatus
 
 # ---------------------------------------------------------------------------
+# Supported Whisper languages (ISO 639-1). "" = auto-detect / no language hint.
+# ---------------------------------------------------------------------------
+SUPPORTED_LANGUAGES: Dict[str, str] = {
+    "fr": "Français",
+    "en": "English",
+    "es": "Español",
+    "de": "Deutsch",
+    "it": "Italiano",
+    "pt": "Português",
+    "nl": "Nederlands",
+    "": "Auto-détection / autre",
+}
+
+
+# ---------------------------------------------------------------------------
 # WebRTC streaming support (optional — requires streamlit-webrtc + av)
 # ---------------------------------------------------------------------------
 _WEBRTC_AVAILABLE = False
@@ -66,11 +81,13 @@ try:
             api_key: str,
             whisper_model: str,
             chunk_duration_s: int = 5,
+            language: str = "fr",
         ) -> None:
             self._server_url = server_url
             self._api_key = api_key or "dummy"
             self._whisper_model = whisper_model
             self._chunk_duration_s = chunk_duration_s
+            self._language = language
             self._sound_chunk = _AudioSegment.empty()
             self._lock = threading.Lock()
             self._result_queue: "_queue_module.Queue" = _queue_module.Queue()
@@ -112,13 +129,22 @@ try:
                 buf.seek(0)
                 from openai import OpenAI as _OpenAI
 
-                client = _OpenAI(base_url=self._server_url, api_key=self._api_key)
-                result = client.audio.transcriptions.create(
-                    model=self._whisper_model,
-                    file=("chunk.wav", buf, "audio/wav"),
-                    language="fr",
-                    prompt="Transcription précise en français.",
+                from src.simple_transcriber import (
+                    _normalize_language as _ns_lang,
+                    _default_prompt_for as _ns_prompt,
                 )
+                client = _OpenAI(base_url=self._server_url, api_key=self._api_key)
+                create_kwargs: Dict[str, Any] = {
+                    "model": self._whisper_model,
+                    "file": ("chunk.wav", buf, "audio/wav"),
+                }
+                _lc = _ns_lang(self._language)
+                if _lc:
+                    create_kwargs["language"] = _lc
+                _ph = _ns_prompt(self._language)
+                if _ph:
+                    create_kwargs["prompt"] = _ph
+                result = client.audio.transcriptions.create(**create_kwargs)
                 text = result.text.strip()
                 if text:
                     self._result_queue.put(
@@ -516,11 +542,18 @@ def model_selectbox(
     return choice or None
 
 
-def _transcribe_audio_bytes(audio_bytes: bytes, server_url: str, api_key: str, whisper_model: str) -> str:
+def _transcribe_audio_bytes(
+    audio_bytes: bytes,
+    server_url: str,
+    api_key: str,
+    whisper_model: str,
+    language: str = "fr",
+) -> str:
     """Send raw audio bytes to the Whisper API and return the transcript text."""
     import io as _io
     import tempfile as _tmp
     from openai import OpenAI
+    from src.simple_transcriber import _normalize_language, _default_prompt_for
 
     client = OpenAI(base_url=server_url, api_key=api_key or "dummy")
     with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -528,19 +561,26 @@ def _transcribe_audio_bytes(audio_bytes: bytes, server_url: str, api_key: str, w
         tmp_path = f.name
     try:
         with open(tmp_path, "rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                model=whisper_model,
-                file=audio_file,
-                language="fr",
-                prompt="Transcription précise en français.",
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": whisper_model,
+                "file": audio_file,
+            }
+            lang_code = _normalize_language(language)
+            if lang_code:
+                create_kwargs["language"] = lang_code
+            prompt_hint = _default_prompt_for(language)
+            if prompt_hint:
+                create_kwargs["prompt"] = prompt_hint
+            result = client.audio.transcriptions.create(**create_kwargs)
         return result.text.strip()
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-def render_recording_section(server_url: str, api_key: str, whisper_model: str) -> None:
+def render_recording_section(
+    server_url: str, api_key: str, whisper_model: str, language: str = "fr"
+) -> None:
     """
     Live recording section:
     - st.audio_input() captures each utterance
@@ -576,7 +616,9 @@ def render_recording_section(server_url: str, api_key: str, whisper_model: str) 
         if audio_hash not in existing_hashes:
             with st.spinner("Transcription en cours..."):
                 try:
-                    text = _transcribe_audio_bytes(audio_bytes, server_url, api_key, whisper_model)
+                    text = _transcribe_audio_bytes(
+                        audio_bytes, server_url, api_key, whisper_model, language=language
+                    )
                 except Exception as exc:
                     text = f"[Erreur de transcription : {exc}]"
 
@@ -652,7 +694,9 @@ def render_recording_section(server_url: str, api_key: str, whisper_model: str) 
         st.info("Appuyez sur le bouton micro ci-dessus pour commencer l'enregistrement.")
 
 
-def render_streaming_section(server_url: str, api_key: str, whisper_model: str) -> None:
+def render_streaming_section(
+    server_url: str, api_key: str, whisper_model: str, language: str = "fr"
+) -> None:
     """
     Real-time streaming transcription using streamlit-webrtc.
 
@@ -708,6 +752,7 @@ def render_streaming_section(server_url: str, api_key: str, whisper_model: str) 
             api_key=api_key,
             whisper_model=whisper_model,
             chunk_duration_s=chunk_duration,
+            language=language,
         ),
         rtc_configuration={
             "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
@@ -952,6 +997,7 @@ def main() -> None:
         api_key = settings.api_key
         whisper_model = settings.whisper_model
         log_level = settings.default_log_level
+        language = settings.language
 
         if is_production:
             st.header("Settings")
@@ -960,12 +1006,37 @@ def main() -> None:
             st.header("Settings")
             run_id = st.text_input("Run ID prefix (optional)")
 
+            # Language selector — applies to every task (simple, SRT, full pipeline,
+            # live recording, streaming). Defaults to settings.language ("fr").
+            _lang_codes = list(SUPPORTED_LANGUAGES.keys())
+            _default_lang_idx = (
+                _lang_codes.index(settings.language)
+                if settings.language in _lang_codes
+                else 0
+            )
+            language = st.selectbox(
+                "🌐 Langue de l'audio",
+                options=_lang_codes,
+                index=_default_lang_idx,
+                format_func=lambda c: SUPPORTED_LANGUAGES[c],
+                help=(
+                    "Code de langue envoyé au serveur de transcription. "
+                    "La plupart des modèles (Whisper, cohere-transcribe…) ont besoin "
+                    "de cet indice pour produire un texte cohérent — laisse-le sur la "
+                    "langue de ton audio. « Auto-détection » omet le paramètre "
+                    "uniquement si ton serveur l'exige explicitement."
+                ),
+                key="audio_language",
+            )
+
             if is_simple_mode:
                 if is_subtitle_mode:
-                    st.caption("🔒 Chunk size: 300s (Optimisé pour SRT)")
-                    chunk_size = 300
+                    chunk_size = settings.srt_chunk_size
+                    st.caption(f"🔒 Chunk size: {chunk_size}s (Optimisé pour SRT)")
                 else:
-                    chunk_size = st.number_input("Chunk size (s)", 60, 3600, 600, 60)
+                    chunk_size = st.number_input(
+                        "Chunk size (s)", 30, 3600, settings.chunk_size, 30
+                    )
 
                 col_clean, col_sum = st.columns(2)
                 with col_clean:
@@ -992,13 +1063,13 @@ def main() -> None:
 
             else:  # Full Mode
                 segment_duration = st.number_input(
-                    "Chunk duration (s)", 60, 3600, 1200, 60
+                    "Chunk duration (s)", 60, 3600, settings.segment_duration, 60
                 )
                 min_speaker_duration = st.number_input(
-                    "Min speaker (s)", 0.1, 5.0, 0.5, 0.1
+                    "Min speaker (s)", 0.1, 5.0, settings.min_speaker_duration, 0.1
                 )
-                max_workers = st.slider("Workers", 1, 8, 2)
-                vad_filter = st.checkbox("VAD Filter", True)
+                max_workers = st.slider("Workers", 1, 8, settings.max_workers)
+                vad_filter = st.checkbox("VAD Filter", settings.vad_filter)
 
                 # --- Speaker count hints ---
                 st.markdown("**🎯 Nombre de locuteurs**")
@@ -1137,12 +1208,12 @@ def main() -> None:
     # and let the pipeline run below using the merged recording as input.
     recording_triggered = st.session_state.get("recording_pipeline_trigger", False)
     if is_recording_mode and not recording_triggered:
-        render_recording_section(server_url, api_key, whisper_model)
+        render_recording_section(server_url, api_key, whisper_model, language=language)
         return  # Don't show the pipeline UI below
 
     # Streaming mode — real-time transcription (no pipeline, just display)
     if is_streaming_mode:
-        render_streaming_section(server_url, api_key, whisper_model)
+        render_streaming_section(server_url, api_key, whisper_model, language=language)
         return  # Don't show the pipeline UI below
 
     # --- Zone de Feedback ---
@@ -1327,6 +1398,7 @@ def main() -> None:
                     "server_url": server_url,
                     "api_key": api_key,
                     "whisper_model": whisper_model,
+                    "language": language,
                     "log_level": log_level,
                     "simple_mode": is_simple_mode_local,
                     "enable_llm_cleaning": enable_llm_cleaning,

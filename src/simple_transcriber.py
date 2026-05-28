@@ -152,11 +152,36 @@ def _looks_like_unsupported_error(exc: Exception) -> bool:
     return any(hint in msg for hint in _UNSUPPORTED_HINTS)
 
 
+def _normalize_language(language: Optional[str]) -> Optional[str]:
+    """Return a clean ISO 639-1 code, or None to disable the hint."""
+    if not language:
+        return None
+    code = str(language).strip().lower()
+    if not code or code in {"auto", "none"}:
+        return None
+    return code
+
+
+def _default_prompt_for(language: Optional[str]) -> Optional[str]:
+    """Return a small contextual prompt aligned with the audio language."""
+    prompts = {
+        "fr": "Transcription précise en français.",
+        "en": "Accurate transcription in English.",
+        "es": "Transcripción precisa en español.",
+        "de": "Genaue Transkription auf Deutsch.",
+        "it": "Trascrizione accurata in italiano.",
+        "pt": "Transcrição precisa em português.",
+        "nl": "Nauwkeurige transcriptie in het Nederlands.",
+    }
+    return prompts.get(_normalize_language(language) or "")
+
+
 def supports_verbose_json(
     client: OpenAI,
     whisper_model: str,
     server_url: str,
     sample: AudioSegment,
+    language: Optional[str] = "fr",
 ) -> bool:
     """
     Probe the server once to determine whether `verbose_json` with
@@ -184,13 +209,16 @@ def supports_verbose_json(
             tmp_path = tmp.name
             probe_audio.export(tmp.name, format="flac")
         with open(tmp_path, "rb") as f:
-            client.audio.transcriptions.create(
-                model=whisper_model,
-                file=f,
-                language="fr",
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
+            probe_kwargs: Dict[str, Any] = {
+                "model": whisper_model,
+                "file": f,
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word", "segment"],
+            }
+            lang_code = _normalize_language(language)
+            if lang_code:
+                probe_kwargs["language"] = lang_code
+            client.audio.transcriptions.create(**probe_kwargs)
         logging.info(
             "Server supports verbose_json (model=%s) — using fine-grained SRT path.",
             whisper_model,
@@ -221,7 +249,13 @@ def supports_verbose_json(
 
 
 @retry(retries=2, delay=3)
-def _transcribe_chunk(client: OpenAI, chunk: AudioSegment, whisper_model: str, prompt: str = None) -> Dict:
+def _transcribe_chunk(
+    client: OpenAI,
+    chunk: AudioSegment,
+    whisper_model: str,
+    prompt: Optional[str] = None,
+    language: Optional[str] = "fr",
+) -> Dict:
     """Transcribe a single audio chunk requesting verbose_json."""
     tmp_file_name = None
     try:
@@ -231,14 +265,19 @@ def _transcribe_chunk(client: OpenAI, chunk: AudioSegment, whisper_model: str, p
 
         with open(tmp_file_name, "rb") as audio_file:
             # On demande explicitement les granularities
-            result = client.audio.transcriptions.create(
-                model=whisper_model,
-                file=audio_file,
-                language="fr",
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-                prompt=prompt or "Transcription précise en français.",
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": whisper_model,
+                "file": audio_file,
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word", "segment"],
+            }
+            lang_code = _normalize_language(language)
+            if lang_code:
+                create_kwargs["language"] = lang_code
+            final_prompt = prompt or _default_prompt_for(language)
+            if final_prompt:
+                create_kwargs["prompt"] = final_prompt
+            result = client.audio.transcriptions.create(**create_kwargs)
 
         if hasattr(result, 'to_dict'):
             data = result.to_dict()
@@ -268,10 +307,12 @@ def _transcribe_segment_text(
     segment: AudioSegment,
     whisper_model: str,
     prompt: Optional[str] = None,
+    language: Optional[str] = "fr",
 ) -> str:
     """
     Transcribe an audio segment using plain `json` (no timestamps).
     Used for endpoints like cohere-transcribe that don't support verbose_json.
+    Pass language=None / prompt=None for non-Whisper endpoints that reject those params.
     """
     tmp_file_name = None
     try:
@@ -280,12 +321,13 @@ def _transcribe_segment_text(
             segment.export(tmp_file.name, format="flac")
 
         with open(tmp_file_name, "rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                model=whisper_model,
-                file=audio_file,
-                language="fr",
-                prompt=prompt or "Transcription précise en français.",
-            )
+            create_kwargs: Dict[str, Any] = {"model": whisper_model, "file": audio_file}
+            lang_code = _normalize_language(language)
+            if lang_code:
+                create_kwargs["language"] = lang_code
+            if prompt:
+                create_kwargs["prompt"] = prompt
+            result = client.audio.transcriptions.create(**create_kwargs)
 
         if hasattr(result, "text"):
             return (result.text or "").strip()
@@ -303,107 +345,97 @@ def _transcribe_segment_text(
                 pass
 
 
-def _detect_speech_regions(
-    audio: AudioSegment,
-    min_silence_ms: int = 400,
-    silence_thresh_db: float = -40.0,
-    keep_silence_ms: int = 150,
-) -> List[Tuple[int, int]]:
+def _split_text_proportionally(
+    text: str,
+    start_s: float,
+    end_s: float,
+) -> List[Dict[str, Any]]:
     """
-    Return absolute (start_ms, end_ms) tuples for every non-silent region.
-
-    The threshold is anchored to the audio's own dBFS so quiet recordings
-    don't end up classified as fully silent. We add a little padding on
-    each side to avoid clipping the first/last consonant.
+    Distribute a chunk's transcribed text into SRT-ready sub-blocks by splitting
+    on sentence boundaries and assigning timestamps proportional to character length.
+    Approximate but produces usable subtitle granularity from long-form transcripts.
     """
-    from pydub.silence import detect_nonsilent
-
-    # Anchor the silence threshold to the average loudness of the file —
-    # absolute dBFS is brittle across recordings.
-    base_db = audio.dBFS if audio.dBFS != float("-inf") else -40.0
-    threshold = max(base_db - 16.0, silence_thresh_db)
-
-    regions = detect_nonsilent(
-        audio,
-        min_silence_len=min_silence_ms,
-        silence_thresh=threshold,
-    )
-    if not regions:
-        # Nothing detected as speech — treat the whole clip as one region
-        # so we still produce *some* output instead of an empty SRT.
-        return [(0, len(audio))]
-
-    out: List[Tuple[int, int]] = []
-    for s, e in regions:
-        s = max(0, s - keep_silence_ms)
-        e = min(len(audio), e + keep_silence_ms)
-        out.append((int(s), int(e)))
+    text = text.strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    if not parts:
+        return [{"text": text, "start": start_s, "end": end_s}]
+    total_chars = sum(len(p) for p in parts) or 1
+    duration = max(end_s - start_s, 0.001)
+    out: List[Dict[str, Any]] = []
+    cursor = start_s
+    for i, p in enumerate(parts):
+        if i == len(parts) - 1:
+            blk_end = end_s
+        else:
+            blk_end = cursor + (len(p) / total_chars) * duration
+        out.append({"text": p, "start": cursor, "end": blk_end})
+        cursor = blk_end
     return out
 
 
-def _split_long_region(
-    start_ms: int, end_ms: int, max_block_ms: int = 7000
-) -> List[Tuple[int, int]]:
-    """Subdivide a region into <= max_block_ms slices of roughly equal length."""
-    duration = end_ms - start_ms
-    if duration <= max_block_ms:
-        return [(start_ms, end_ms)]
-    n = math.ceil(duration / max_block_ms)
-    slice_len = duration / n
-    return [
-        (int(start_ms + i * slice_len), int(start_ms + (i + 1) * slice_len))
-        for i in range(n)
-    ]
-
-
-def _transcribe_silence_based(
+def _transcribe_chunked_plain_text(
     audio: AudioSegment,
     client: OpenAI,
     whisper_model: str,
-    max_block_ms: int = 7000,
+    chunk_ms: int,
+    overlap_ms: int = 0,
+    whisper_compat: bool = True,
+    language: Optional[str] = "fr",
 ) -> List[Dict[str, Any]]:
     """
-    Fallback transcription path for endpoints that don't expose timestamps.
-    Returns a list of SRT-ready blocks: ``{"text": str, "start": float, "end": float}``
-    where start/end are absolute seconds in the original audio.
+    Transcribe in chunk_ms slices and return SRT-ready blocks.
+    Used when the server returns no timestamps — keeps each API call's audio
+    long enough (typically 5–10 min) to preserve transcription coherence on
+    long-form models like cohere-transcribe, then approximates SRT granularity
+    by sentence-splitting within each chunk.
     """
-    regions = _detect_speech_regions(audio)
-    logging.info(
-        "Silence-based segmentation: %d region(s) detected over %.1fs of audio.",
-        len(regions),
-        len(audio) / 1000.0,
-    )
-
+    duration_ms = len(audio)
+    if duration_ms == 0:
+        return []
+    step_ms = max(chunk_ms - overlap_ms, 1)
     blocks: List[Dict[str, Any]] = []
+    cursor = 0
     last_text_tail: Optional[str] = None
 
-    for region_idx, (r_start, r_end) in enumerate(regions, 1):
-        sub_blocks = _split_long_region(r_start, r_end, max_block_ms=max_block_ms)
-        for s_ms, e_ms in sub_blocks:
-            sub_audio = audio[s_ms:e_ms]
-            try:
-                text = _transcribe_segment_text(
-                    client,
-                    sub_audio,
-                    whisper_model,
-                    prompt=last_text_tail,
-                )
-            except Exception as exc:
-                logging.warning(
-                    "Region %d (%.1fs-%.1fs) failed, skipping: %s",
-                    region_idx, s_ms / 1000.0, e_ms / 1000.0, exc,
-                )
-                continue
-            if not text:
-                continue
-            blocks.append({
-                "text": text,
-                "start": s_ms / 1000.0,
-                "end": e_ms / 1000.0,
-            })
+    while cursor < duration_ms:
+        end = min(cursor + chunk_ms, duration_ms)
+        chunk = audio[cursor:end]
+        try:
+            # `language` is sent on every call — cohere-transcribe (and similar)
+            # reject `verbose_json` but still rely on the language hint to
+            # produce coherent output. `prompt` is suppressed in non-Whisper
+            # mode since not every long-form server supports it.
+            text = _transcribe_segment_text(
+                client,
+                chunk,
+                whisper_model,
+                prompt=last_text_tail if whisper_compat else None,
+                language=language,
+            )
+        except Exception as exc:
+            logging.warning(
+                "Chunk %.1fs-%.1fs failed, skipping: %s",
+                cursor / 1000.0, end / 1000.0, exc,
+            )
+            if end >= duration_ms:
+                break
+            cursor += step_ms
+            continue
+
+        if text:
+            blocks.extend(_split_text_proportionally(
+                text, cursor / 1000.0, end / 1000.0,
+            ))
             last_text_tail = text[-200:]
 
+        if end >= duration_ms:
+            break
+        cursor += step_ms
+
     return blocks
+
 
 def transcribe_long_audio(
     audio_path: str,
@@ -412,6 +444,7 @@ def transcribe_long_audio(
     chunk_size: int = 300,
     overlap: int = 10,
     whisper_model: str = "whisper",
+    language: Optional[str] = "fr",
     enable_llm_cleaning: bool = True,
     enable_summary: bool = True,
     llm_base_url: Optional[str] = None,
@@ -437,14 +470,16 @@ def transcribe_long_audio(
         duration_ms = len(audio)
 
         chunk_ms = chunk_size * 1000
-        overlap_ms = overlap * 1000
+        # Cap overlap at 20 % of the chunk so short SRT-tuned chunks (e.g. 35 s)
+        # don't end up re-transcribing a third of the audio.
+        overlap_ms = min(overlap * 1000, chunk_ms // 5)
 
         # --- Capability probe — does the server support verbose_json? ---
         # If yes (Whisper-style): use word-level timestamps for fine SRT.
         # If no (cohere-transcribe and similar): switch to silence-based
         # segmentation across the whole audio.
         timestamps_available = supports_verbose_json(
-            client, whisper_model, server_url, audio
+            client, whisper_model, server_url, audio, language=language
         )
 
         raw_results = []
@@ -469,7 +504,10 @@ def transcribe_long_audio(
                 last_text = raw_results[-1]['text'][-200:] if raw_results and raw_results[-1].get('text') else None
 
                 try:
-                    transcription = _transcribe_chunk(client, chunk, whisper_model, prompt=last_text)
+                    transcription = _transcribe_chunk(
+                        client, chunk, whisper_model,
+                        prompt=last_text, language=language,
+                    )
                 except Exception as exc:
                     # If a chunk fails specifically because of verbose_json (rare —
                     # would mean the server's behaviour changed mid-run), flip the
@@ -528,13 +566,35 @@ def transcribe_long_audio(
             all_segments.sort(key=lambda x: x['start'])
 
         # If the probe (or a mid-run fallback) determined the server doesn't
-        # support timestamps, build the SRT from silence-detected regions.
+        # support timestamps, transcribe in chunk_ms slices for coherent text.
+        # We deliberately do NOT use silence-based 7s segmentation here — long-form
+        # models (cohere-transcribe and similar) produce gibberish on isolated
+        # short clips; they need full-context chunks to stay coherent.
         if not timestamps_available:
             logging.info(
-                "Using silence-based fallback path (model=%s).", whisper_model
+                "Server has no timestamps — using chunked plain-text path "
+                "(chunk=%.0fs, model=%s).",
+                chunk_ms / 1000.0, whisper_model,
             )
-            srt_blocks_fallback = _transcribe_silence_based(
-                audio, client, whisper_model
+            srt_blocks_fallback = _transcribe_chunked_plain_text(
+                audio, client, whisper_model,
+                chunk_ms=chunk_ms, overlap_ms=overlap_ms,
+                whisper_compat=False, language=language,
+            )
+        elif not all_words and not all_segments:
+            # verbose_json was accepted by the probe but the server returned no
+            # timestamps (some endpoints silently ignore the request_format and
+            # return plain text). Switch to the non-Whisper chunked path.
+            logging.warning(
+                "verbose_json probe passed but no timestamps returned (model=%s). "
+                "Falling back to chunked plain-text transcription.",
+                whisper_model,
+            )
+            _TIMESTAMP_CAPABILITY[(server_url or "", whisper_model)] = False
+            srt_blocks_fallback = _transcribe_chunked_plain_text(
+                audio, client, whisper_model,
+                chunk_ms=chunk_ms, overlap_ms=overlap_ms,
+                whisper_compat=False, language=language,
             )
 
         # --- Reconstruction texte complet ---

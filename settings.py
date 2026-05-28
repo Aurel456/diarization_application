@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="API_KEY")
     whisper_model: str = Field(default="whisper", alias="WHISPER_MODEL")
     hf_token: Optional[str] = Field(default=None, alias="HF_TOKEN")
+    # Audio language for Whisper (ISO 639-1). Empty / "auto" disables the hint
+    # so the server auto-detects — required for endpoints (cohere-transcribe…)
+    # that reject the `language` parameter.
+    language: str = Field(default="fr", alias="APP_LANGUAGE")
 
     # --- LLM ---
     # NB: `llm_base_url` was removed as a separate setting — it's now derived from
@@ -75,6 +79,9 @@ class Settings(BaseSettings):
 
     # --- Pipeline parameters ---
     chunk_size: int = Field(default=600, alias="APP_CHUNK_SIZE")
+    # Smaller default for SRT mode — finer subtitle granularity matters more
+    # than long-form context for word-level alignment.
+    srt_chunk_size: int = Field(default=35, alias="APP_SRT_CHUNK_SIZE")
     segment_duration: int = Field(default=1200, alias="APP_SEGMENT_DURATION")
     min_speaker_duration: float = Field(default=0.5, alias="APP_MIN_SPEAKER_DURATION")
     max_workers: int = Field(default=2, alias="APP_MAX_WORKERS")

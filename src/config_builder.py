@@ -65,6 +65,7 @@ def build_pipeline_config(
         server_url=overrides.get("server_url", settings.server_url) or None,
         whisper_model=overrides.get("whisper_model", settings.whisper_model) or "whisper",
         api_key=overrides.get("api_key", settings.api_key) or None,
+        language=overrides.get("language", settings.language) or "fr",
         llm_model=overrides.get("llm_model", settings.llm_model),
         # Single endpoint: llm_base_url defaults to server_url unless explicitly overridden.
         llm_base_url=overrides.get(
@@ -141,6 +142,7 @@ _CACHE_RELEVANT_FIELDS: tuple[str, ...] = (
     "input_audio_paths",
     "server_url",
     "whisper_model",
+    "language",
     "llm_model",
     "llm_base_url",
     "enable_llm_cleaning",

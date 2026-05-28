@@ -117,6 +117,9 @@ class PipelineConfig:
     server_url: Optional[str] = None
     whisper_model: str = "whisper"
     api_key: Optional[str] = None
+    # ISO 639-1 language hint for Whisper. Empty string / "auto" disables the
+    # hint (needed for endpoints that reject the `language` parameter).
+    language: str = "fr"
     llm_model: Optional[str] = None
     llm_base_url: Optional[str] = None
     run_id: Optional[str] = None
@@ -568,6 +571,7 @@ def run_simple_transcription_pipeline(
                 server_url=config.server_url,
                 api_key=config.api_key,
                 whisper_model=config.whisper_model,
+                language=config.language,
                 enable_llm_cleaning=(
                     config.enable_llm_cleaning
                     and bool(config.llm_base_url and config.llm_model)
