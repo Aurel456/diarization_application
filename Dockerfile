@@ -12,7 +12,6 @@ ENV no_proxy=$NO_PROXY
 # Disable pickle cache, force cleanup, redirect experiments to /tmp.
 # All app state vanishes at container restart — only the model_storage volume
 # (mounted read-only) persists across runs.
-ENV APP_STATELESS=true
 ENV APP_ENV=production
 # Logs go to stdout for `docker logs` (no logs.txt file path expected on disk)
 ENV APP_LOG_TO_CONSOLE=true

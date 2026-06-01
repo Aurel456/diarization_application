@@ -148,8 +148,15 @@ class Settings(BaseSettings):
         # Expand root to absolute
         object.__setattr__(self, "root", os.path.abspath(self.root))
 
+        is_prod = self.app_env is AppEnv.PRODUCTION
+
+        # Production always implies stateless — no pickle cache, experiments in /tmp
+        if is_prod:
+            object.__setattr__(self, "stateless", True)
+        stateless = self.stateless
+
         # Stateless mode forces no persistent experiments dir
-        if self.stateless and not self.experiments_root:
+        if stateless and not self.experiments_root:
             import tempfile
 
             object.__setattr__(
@@ -164,9 +171,6 @@ class Settings(BaseSettings):
             )
         else:
             object.__setattr__(self, "experiments_root", os.path.abspath(self.experiments_root))
-
-        is_prod = self.app_env is AppEnv.PRODUCTION
-        stateless = self.stateless
 
         def _default(value: Optional[bool], prod_val: bool, dev_val: bool) -> bool:
             if value is not None:
