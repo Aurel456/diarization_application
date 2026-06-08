@@ -141,9 +141,10 @@ try:
                 _lc = _ns_lang(self._language)
                 if _lc:
                     create_kwargs["language"] = _lc
-                _ph = _ns_prompt(self._language)
-                if _ph:
-                    create_kwargs["prompt"] = _ph
+                if "cohere" not in self._whisper_model.lower():
+                    _ph = _ns_prompt(self._language)
+                    if _ph:
+                        create_kwargs["prompt"] = _ph
                 result = client.audio.transcriptions.create(**create_kwargs)
                 text = result.text.strip()
                 if text:
@@ -568,9 +569,10 @@ def _transcribe_audio_bytes(
             lang_code = _normalize_language(language)
             if lang_code:
                 create_kwargs["language"] = lang_code
-            prompt_hint = _default_prompt_for(language)
-            if prompt_hint:
-                create_kwargs["prompt"] = prompt_hint
+            if "cohere" not in whisper_model.lower():
+                prompt_hint = _default_prompt_for(language)
+                if prompt_hint:
+                    create_kwargs["prompt"] = prompt_hint
             result = client.audio.transcriptions.create(**create_kwargs)
         return result.text.strip()
     finally:

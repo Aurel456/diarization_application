@@ -43,58 +43,45 @@ jobs_lock = threading.Lock()
 # One cancellation event per job
 cancel_events: Dict[str, threading.Event] = {}
 
+_ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".mov", ".avi", ".mkv"}
+_VALID_MM_FORMATS = {"standard", "executif", "technique", "projet", "rh_social", "formation"}
 
-# Models
-class TranscriptionRequest(BaseModel):
-    """Request model for transcription (when providing file path instead of upload)."""
 
-    audio_path: str
-    run_id: Optional[str] = None
-    enable_speaker_identification: Optional[bool] = None
-    enable_meeting_minutes: Optional[bool] = None
-
+# --- Pydantic models ---
 
 class JobStatus(BaseModel):
     """Response model for job status."""
-
     job_id: str
-    status: str  # "processing", "completed", "failed"
+    status: str  # queued | processing | completed | failed | cancelled
     message: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     created_at: str
     completed_at: Optional[str] = None
 
 
-# Background task function
-def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, Any]):
-    """
-    Background task to run the audio processing pipeline.
+# --- Background task ---
 
-    Args:
-        job_id: Unique job identifier
-        audio_path: Path to the audio file
-        config_overrides: Override values for PipelineConfig
-    """
+def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, Any]):
+    """Run the audio processing pipeline in a background thread."""
     try:
         with jobs_lock:
             jobs[job_id]["status"] = "processing"
 
         logger.info(f"Starting job {job_id} for audio: {audio_path}")
 
-        # Build pipeline config via the shared builder
         from src.config_builder import build_pipeline_config as _build
 
         overrides = {k: v for k, v in config_overrides.items() if v is not None}
+        # Drop zero/negative values for numeric params (Swagger UI sends 0 by default)
+        for _key in ("segment_duration", "max_workers"):
+            if overrides.get(_key, 1) <= 0:
+                overrides.pop(_key, None)
         overrides["run_id"] = overrides.get("run_id") or f"api_{job_id}"
-        # Attach the cancellation event for this job
         overrides["cancel_event"] = cancel_events.setdefault(job_id, threading.Event())
 
         base_config = _build(audio_paths=[audio_path], overrides=overrides)
-
-        # Run pipeline
         result = run_pipeline(base_config)
 
-        # Serialize result (exclude large objects)
         result_dict = {
             "success": result.success,
             "run_id": result.run_id,
@@ -111,39 +98,25 @@ def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, 
         }
 
         with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": "completed",
-                    "result": result_dict,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-
+            jobs[job_id].update({
+                "status": "completed",
+                "result": result_dict,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
         logger.info(f"Job {job_id} completed successfully")
 
     except Exception as e:
         logger.exception(f"Job {job_id} failed: {e}")
-        # Map specific error classes to distinct statuses so clients can branch
         from src.errors import CancelledError, PipelineError
-        if isinstance(e, CancelledError):
-            final_status = "cancelled"
-        elif isinstance(e, PipelineError):
-            final_status = "failed"
-        else:
-            final_status = "failed"
+        final_status = "cancelled" if isinstance(e, CancelledError) else "failed"
         with jobs_lock:
-            jobs[job_id].update(
-                {
-                    "status": final_status,
-                    "message": str(e),
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
+            jobs[job_id].update({
+                "status": final_status,
+                "message": str(e),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
     finally:
-        # Free the event entry
         cancel_events.pop(job_id, None)
-        # In stateless mode, immediately delete the uploaded file once we're done
-        # — the pipeline already copied it into experiments_dir if needed.
         if settings.stateless:
             try:
                 up = Path(audio_path)
@@ -154,51 +127,27 @@ def process_audio_job(job_id: str, audio_path: str, config_overrides: Dict[str, 
                 logger.warning(f"Failed to remove upload {audio_path}: {cleanup_exc}")
 
 
-# Endpoints
-@app.get("/")
-def root():
-    return {"message": "Audio Processing API", "version": "1.0.0"}
+# --- Shared upload helper ---
 
-
-@app.post("/api/v1/transcribe", response_model=JobStatus)
-async def transcribe_audio(
+async def _upload_and_queue(
+    file: UploadFile,
+    config_overrides: Dict[str, Any],
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    run_id: Optional[str] = Form(None),
-    enable_speaker_identification: Optional[bool] = Form(None),
-    enable_meeting_minutes: Optional[bool] = Form(None),
-    segment_duration: Optional[int] = Form(None),
-    max_workers: Optional[int] = Form(None),
-    enable_llm_cleaning: Optional[bool] = Form(None),
-    enable_summary: Optional[bool] = Form(None),
-    num_speakers: Optional[int] = Form(None),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None),
-    meeting_minutes_format: Optional[str] = Form(None),
-    whisper_model: Optional[str] = Form(None),
-):
-    """
-    Upload an audio file and start transcription/diarization pipeline.
-
-    Returns a job ID that can be used to check status and download results.
-    """
-    # Validate file type
-    allowed_extensions = {".mp3", ".wav", ".m4a", ".mp4", ".mov", ".avi", ".mkv"}
+) -> JobStatus:
+    """Validate + save file, register job, queue background task."""
     file_ext = Path(file.filename).suffix.lower()
-    if file_ext not in allowed_extensions:
+    if file_ext not in _ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file type. Allowed: {allowed_extensions}",
+            detail=f"Type de fichier non supporté. Acceptés : {sorted(_ALLOWED_EXTENSIONS)}",
         )
 
-    # Save uploaded file. In stateless mode (Docker) put it under the system
-    # temp dir so it gets wiped at container restart; otherwise stay under
-    # ./api_uploads/ for easier debugging on a dev machine.
     job_id = str(uuid.uuid4())
-    if settings.stateless:
-        upload_dir = Path(tempfile.gettempdir()) / "diarization_api_uploads"
-    else:
-        upload_dir = Path("api_uploads")
+    upload_dir = (
+        Path(tempfile.gettempdir()) / "diarization_api_uploads"
+        if settings.stateless
+        else Path("api_uploads")
+    )
     upload_dir.mkdir(parents=True, exist_ok=True)
     audio_path = upload_dir / f"{job_id}{file_ext}"
 
@@ -207,9 +156,8 @@ async def transcribe_audio(
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
         logger.error(f"Failed to save uploaded file: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        raise HTTPException(status_code=500, detail="Échec de la sauvegarde du fichier")
 
-    # Register job
     with jobs_lock:
         jobs[job_id] = {
             "job_id": job_id,
@@ -219,42 +167,176 @@ async def transcribe_audio(
             "original_filename": file.filename,
         }
 
-    # Queue background task
-    config_overrides = {
+    background_tasks.add_task(process_audio_job, job_id, str(audio_path), config_overrides)
+    return JobStatus(job_id=job_id, status="queued", created_at=jobs[job_id]["created_at"])
+
+
+# --- Endpoints ---
+
+@app.get("/")
+def root():
+    return {"message": "Audio Processing API", "version": "1.0.0"}
+
+
+@app.post(
+    "/api/v1/transcribe/simple",
+    response_model=JobStatus,
+    summary="Transcription rapide",
+    description="Whisper uniquement, sans diarization. Retourne TXT + SRT.",
+    tags=["Transcription"],
+)
+async def transcribe_simple(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    run_id: Optional[str] = Form(None),
+    whisper_model: Optional[str] = Form(None, description="Modèle Whisper (défaut depuis .env)"),
+    enable_summary: Optional[bool] = Form(None, description="Générer un résumé LLM"),
+    language: Optional[str] = Form(None, description="Langue audio ISO 639-1 (ex: fr, en)"),
+):
+    return await _upload_and_queue(file, {
         "run_id": run_id,
-        "enable_speaker_identification": enable_speaker_identification,
-        "enable_meeting_minutes": enable_meeting_minutes,
+        "simple_mode": True,
+        "enable_llm_cleaning": False,
+        "enable_summary": enable_summary,
+        "enable_speaker_identification": False,
+        "enable_meeting_minutes": False,
+        "whisper_model": whisper_model,
+        "language": language,
+    }, background_tasks)
+
+
+@app.post(
+    "/api/v1/transcribe/srt",
+    response_model=JobStatus,
+    summary="Sous-titres (SRT)",
+    description="Transcription horodatée avec chunks fins pour la précision des sous-titres. Retourne SRT + TXT.",
+    tags=["Transcription"],
+)
+async def transcribe_srt(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    run_id: Optional[str] = Form(None),
+    whisper_model: Optional[str] = Form(None, description="Modèle Whisper (défaut depuis .env)"),
+    language: Optional[str] = Form(None, description="Langue audio ISO 639-1 (ex: fr, en)"),
+):
+    return await _upload_and_queue(file, {
+        "run_id": run_id,
+        "simple_mode": True,
+        "enable_llm_cleaning": False,
+        "enable_summary": False,
+        "enable_speaker_identification": False,
+        "enable_meeting_minutes": False,
+        "whisper_model": whisper_model,
+        "language": language,
+        "chunk_size": 35,  # chunks fins pour horodatage SRT précis
+    }, background_tasks)
+
+
+@app.post(
+    "/api/v1/transcribe/diarize",
+    response_model=JobStatus,
+    summary="Détection des locuteurs",
+    description=(
+        "Pipeline complet : diarization + transcription + LLM optionnel. "
+        "Retourne DOCX, TXT, SRT, et optionnellement résumé, identification des locuteurs, compte rendu."
+    ),
+    tags=["Diarization"],
+)
+async def transcribe_diarize(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    run_id: Optional[str] = Form(None),
+    segment_duration: Optional[int] = Form(None, ge=1, description="Durée des chunks audio en secondes (défaut : 1200)"),
+    max_workers: Optional[int] = Form(None, ge=1, description="Workers parallèles pour la diarization (défaut : 2)"),
+    num_speakers: Optional[int] = Form(None, ge=1, description="Nombre exact de locuteurs (optionnel)"),
+    min_speakers: Optional[int] = Form(None, ge=1, description="Borne minimum de locuteurs (optionnel)"),
+    max_speakers: Optional[int] = Form(None, ge=1, description="Borne maximum de locuteurs (optionnel)"),
+    enable_llm_cleaning: Optional[bool] = Form(None, description="Nettoyage LLM (orthographe, ponctuation)"),
+    enable_summary: Optional[bool] = Form(None, description="Générer un résumé LLM"),
+    enable_speaker_identification: Optional[bool] = Form(None, description="Identifier les locuteurs via LLM"),
+    enable_meeting_minutes: Optional[bool] = Form(None, description="Générer un compte rendu"),
+    meeting_minutes_format: Optional[str] = Form(None, description="standard | executif | technique | projet | rh_social | formation"),
+    whisper_model: Optional[str] = Form(None, description="Modèle Whisper (défaut depuis .env)"),
+    language: Optional[str] = Form(None, description="Langue audio ISO 639-1 (ex: fr, en)"),
+):
+    if meeting_minutes_format and meeting_minutes_format not in _VALID_MM_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"meeting_minutes_format invalide. Valeurs acceptées : {sorted(_VALID_MM_FORMATS)}",
+        )
+    return await _upload_and_queue(file, {
+        "run_id": run_id,
+        "simple_mode": False,
         "segment_duration": segment_duration,
         "max_workers": max_workers,
-        "enable_llm_cleaning": enable_llm_cleaning,
-        "enable_summary": enable_summary,
         "num_speakers": num_speakers,
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
+        "enable_llm_cleaning": enable_llm_cleaning,
+        "enable_summary": enable_summary,
+        "enable_speaker_identification": enable_speaker_identification,
+        "enable_meeting_minutes": enable_meeting_minutes,
         "meeting_minutes_format": meeting_minutes_format,
         "whisper_model": whisper_model,
-    }
-
-    background_tasks.add_task(
-        process_audio_job, job_id, str(audio_path), config_overrides
-    )
-
-    return JobStatus(
-        job_id=job_id,
-        status="queued",
-        created_at=jobs[job_id]["created_at"],
-    )
+        "language": language,
+    }, background_tasks)
 
 
-@app.get("/api/v1/status/{job_id}", response_model=JobStatus)
+@app.post(
+    "/api/v1/transcribe",
+    response_model=JobStatus,
+    summary="Endpoint générique (tous paramètres)",
+    description="Endpoint complet avec tous les paramètres disponibles. Préférer les endpoints spécialisés ci-dessus.",
+    tags=["Générique"],
+)
+async def transcribe_audio(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    run_id: Optional[str] = Form(None),
+    simple_mode: Optional[bool] = Form(None, description="Transcription simple sans diarization"),
+    segment_duration: Optional[int] = Form(None, ge=1, description="Durée des chunks audio en secondes (défaut : 1200)"),
+    max_workers: Optional[int] = Form(None, ge=1, description="Workers parallèles pour la diarization (défaut : 2)"),
+    num_speakers: Optional[int] = Form(None, ge=1, description="Nombre exact de locuteurs (optionnel)"),
+    min_speakers: Optional[int] = Form(None, ge=1, description="Borne minimum de locuteurs (optionnel)"),
+    max_speakers: Optional[int] = Form(None, ge=1, description="Borne maximum de locuteurs (optionnel)"),
+    enable_llm_cleaning: Optional[bool] = Form(None),
+    enable_summary: Optional[bool] = Form(None),
+    enable_speaker_identification: Optional[bool] = Form(None),
+    enable_meeting_minutes: Optional[bool] = Form(None),
+    meeting_minutes_format: Optional[str] = Form(None, description="standard | executif | technique | projet | rh_social | formation"),
+    whisper_model: Optional[str] = Form(None, description="Modèle Whisper (défaut depuis .env)"),
+    language: Optional[str] = Form(None, description="Langue audio ISO 639-1 (ex: fr, en)"),
+):
+    if meeting_minutes_format and meeting_minutes_format not in _VALID_MM_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"meeting_minutes_format invalide. Valeurs acceptées : {sorted(_VALID_MM_FORMATS)}",
+        )
+    return await _upload_and_queue(file, {
+        "run_id": run_id,
+        "simple_mode": simple_mode,
+        "segment_duration": segment_duration,
+        "max_workers": max_workers,
+        "num_speakers": num_speakers,
+        "min_speakers": min_speakers,
+        "max_speakers": max_speakers,
+        "enable_llm_cleaning": enable_llm_cleaning,
+        "enable_summary": enable_summary,
+        "enable_speaker_identification": enable_speaker_identification,
+        "enable_meeting_minutes": enable_meeting_minutes,
+        "meeting_minutes_format": meeting_minutes_format,
+        "whisper_model": whisper_model,
+        "language": language,
+    }, background_tasks)
+
+
+@app.get("/api/v1/status/{job_id}", response_model=JobStatus, tags=["Jobs"])
 def get_job_status(job_id: str):
-    """Get the status of a processing job."""
+    """Statut d'un job (queued → processing → completed / failed / cancelled)."""
     with jobs_lock:
         job = jobs.get(job_id)
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     return JobStatus(
         job_id=job_id,
         status=job["status"],
@@ -265,25 +347,21 @@ def get_job_status(job_id: str):
     )
 
 
-@app.get("/api/v1/download/{job_id}/{file_type}")
+@app.get("/api/v1/download/{job_id}/{file_type}", tags=["Jobs"])
 def download_result(job_id: str, file_type: str):
     """
-    Download a result file for a completed job.
+    Télécharger un fichier résultat.
 
-    file_type options: docx, txt, srt, summary, speaker_json, meeting_json, meeting_md
+    file_type : docx | txt | srt | summary | speaker_json | standard | executif | technique | projet | rh_social | formation
     """
     with jobs_lock:
         job = jobs.get(job_id)
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Job not completed yet")
 
     result = job.get("result", {})
-    file_path = None
-
     mapping = {
         "docx": result.get("docx_path"),
         "txt": result.get("txt_path"),
@@ -291,28 +369,22 @@ def download_result(job_id: str, file_type: str):
         "summary": result.get("summary_path"),
         "speaker_json": result.get("speaker_identification_path"),
     }
-
-    # Meeting minutes have multiple files
     meeting_paths = result.get("meeting_minutes_paths", {})
-    if file_type in meeting_paths:
-        file_path = meeting_paths[file_type]
-    else:
-        file_path = mapping.get(file_type)
+    file_path = meeting_paths.get(file_type) or mapping.get(file_type)
 
     if not file_path or not Path(file_path).exists():
-        raise HTTPException(
-            status_code=404, detail=f"File type '{file_type}' not available"
-        )
+        raise HTTPException(status_code=404, detail=f"Fichier '{file_type}' non disponible")
 
-    filename = Path(file_path).name
     return FileResponse(
-        path=file_path, filename=filename, media_type="application/octet-stream"
+        path=file_path,
+        filename=Path(file_path).name,
+        media_type="application/octet-stream",
     )
 
 
-@app.post("/api/v1/cancel/{job_id}")
+@app.post("/api/v1/cancel/{job_id}", tags=["Jobs"])
 def cancel_job(job_id: str):
-    """Request graceful cancellation of a running job."""
+    """Annulation gracieuse d'un job en cours."""
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
@@ -327,38 +399,30 @@ def cancel_job(job_id: str):
     return {"message": f"Cancellation requested for {job_id}"}
 
 
-@app.delete("/api/v1/job/{job_id}")
+@app.delete("/api/v1/job/{job_id}", tags=["Jobs"])
 def cleanup_job(job_id: str):
-    """Delete a job and its associated files (for cleanup)."""
+    """Supprimer un job et son fichier audio uploadé."""
     with jobs_lock:
         job = jobs.pop(job_id, None)
-
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
-    # Optionally delete uploaded file and generated outputs
     audio_path = Path(job.get("audio_path", ""))
     if audio_path.exists():
         audio_path.unlink()
-
-    # Could also clean up experiment directories if needed
-
     return {"message": f"Job {job_id} cleaned up"}
 
 
-@app.get("/api/v1/jobs")
+@app.get("/api/v1/jobs", tags=["Jobs"])
 def list_jobs(status: Optional[str] = None):
     """
-    List all jobs, optionally filtered by status.
+    Lister tous les jobs, optionnellement filtrés par statut.
 
-    status: queued | processing | completed | failed | cancelled
+    status : queued | processing | completed | failed | cancelled
     """
     with jobs_lock:
         all_jobs = list(jobs.values())
-
     if status:
         all_jobs = [j for j in all_jobs if j["status"] == status]
-
     all_jobs.sort(key=lambda x: x["created_at"], reverse=True)
     return {
         "total": len(all_jobs),
@@ -375,16 +439,17 @@ def list_jobs(status: Optional[str] = None):
     }
 
 
-# Health check
-@app.get("/health")
+# --- Health ---
+
+@app.get("/health", tags=["Health"])
 def health_check():
-    """Liveness probe — always returns 200 if the API process is up."""
+    """Liveness probe — toujours 200 si le process API tourne."""
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-@app.get("/health/services")
+@app.get("/health/services", tags=["Health"])
 def health_services():
-    """Check upstream service availability (Whisper + LLM). May be slow (~10s timeout)."""
+    """Vérifie la disponibilité des serveurs Whisper et LLM (~10s timeout)."""
     statuses = check_all_services(
         server_url=settings.server_url,
         llm_base_url=settings.llm_base_url,

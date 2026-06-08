@@ -144,6 +144,11 @@ _UNSUPPORTED_HINTS: Tuple[str, ...] = (
     "timestamp_granularit",
     "unsupported",
     "invalid response_format",
+    # Some servers (e.g. cohere-transcribe) return "invalid model name" when
+    # verbose_json + timestamp_granularities are requested, even though the model
+    # works fine for plain transcription.
+    "invalid model",
+    "invalid param",
 )
 
 

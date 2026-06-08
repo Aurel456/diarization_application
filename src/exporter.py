@@ -56,6 +56,22 @@ def clean_before_export(text: Any) -> str:
     res = re.sub(r"\bagraf\b", "AGRAF", res, flags=re.IGNORECASE)
     res = re.sub(r"\bDTNU(?!M)\b", "DTNUM", res)  # Negative lookahead
 
+    # Artefacts structurels Cohere
+    # Point entre deux minuscules : "de.souligner" → "de souligner"
+    res = re.sub(r"(?<=[a-zéèêëàâùûüïîôçœæ])\.(?=[a-zéèêëàâùûüïîôçœæ])", " ", res)
+    # Ponctuation parasite avant conjonction : "exister. et" / "organisé ? et" → "exister et"
+    res = re.sub(r"\s*[.?!]\s+(et|ou|mais|donc|or|ni|car)\b", r" \1", res)
+    # Préposition/article collé à un mot : "deCommunication" → "de communication"
+    res = re.sub(
+        r"\b(de|du|le|la|les|en|un|une|des|au|aux)([A-ZÉÈÊËÀÂÙÛÜÏÎÔÇ][a-zéèêëàâùûüïîôçœæ]+)\b",
+        lambda m: m.group(1) + " " + m.group(2).lower(),
+        res,
+    )
+    # Acronymes Cohere
+    res = re.sub(r"\bXAM\b", "CSAM", res, flags=re.IGNORECASE)
+    res = re.sub(r"\bADG\s+FIP\b", "DGFIP", res, flags=re.IGNORECASE)
+    res = re.sub(r"d'ITRIX(?:\s+\d+)?", "dite Rixain", res, flags=re.IGNORECASE)
+
     # Trim final whitespace
     return res.strip()
 

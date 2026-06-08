@@ -81,8 +81,7 @@ model_storage/
 
 ```env
 # === ENVIRONNEMENT ===
-APP_ENV=development           # development | production
-APP_STATELESS=false           # true → mode Docker stateless (pas de cache pickle)
+APP_ENV=development           # development | production (production ⇒ stateless auto : pas de cache pickle)
 
 # === FICHIERS D'ENTRÉE ===
 ROOT=chemin/vers/les/données
@@ -325,45 +324,61 @@ Docs interactives : `http://localhost:8000/docs`.
 | Méthode | URL | Description |
 |---------|-----|-------------|
 | `GET` | `/` | Info API |
-| `GET` | `/health` | Health check |
-| `POST` | `/api/v1/transcribe` | Upload audio → démarre un job |
-| `GET` | `/api/v1/status/{job_id}` | Statut (`queued`/`processing`/`completed`/`failed`/`cancelled`) |
-| `POST` | `/api/v1/cancel/{job_id}` | Annulation gracieuse du job en cours |
-| `GET` | `/api/v1/download/{job_id}/{type}` | Télécharger un résultat |
-| `DELETE` | `/api/v1/job/{job_id}` | Supprimer un job et ses fichiers |
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/health/services` | Vérifie Whisper + LLM (~10s timeout) |
+| `POST` | `…/transcribe` | Générique (tous paramètres) |
+| `POST` | `…/transcribe/simple` | Transcription rapide (Whisper seul, TXT + SRT) |
+| `POST` | `…/transcribe/srt` | Sous-titres horodatés (chunks fins) |
+| `POST` | `…/transcribe/diarize` | Pipeline complet (locuteurs + CR optionnels) |
+| `GET` | `…/status/{job_id}` | Statut (`queued` → `processing` → `completed` / `failed` / `cancelled`) |
+| `GET` | `…/download/{job_id}/{type}` | Télécharger un résultat |
+| `POST` | `…/cancel/{job_id}` | Annulation gracieuse |
+| `DELETE` | `…/job/{job_id}` | Supprimer un job |
+| `GET` | `…/jobs` | Lister tous les jobs (filtre `?status=`) |
+
+*Base commune :* tous les endpoints `…` sont préfixés par `/api/v1`.
 
 ### Types téléchargeables
 
-`docx` · `txt` · `srt` · `summary` · `speaker_json` · `json` (CR) · `markdown` (CR)
+`docx` · `txt` · `srt` · `summary` · `speaker_json` · `standard` · `executif` · `technique` · `projet` · `rh_social` · `formation`
 
-### Exemple
+### Exemples
 
 ```bash
-# Lancer
-curl -X POST http://localhost:8000/api/v1/transcribe \
-  -F "file=@reunion.mp4" \
-  -F "enable_speaker_identification=true" \
-  -F "enable_meeting_minutes=true"
+# 1. Transcription rapide (Whisper seul)
+curl -X POST http://localhost:8000/api/v1/transcribe/simple \
+  -F "file=@audio.mp3"
 # → {"job_id": "abc-123", "status": "queued", ...}
 
-# Suivre
+# 2. Pipeline complet avec 3 locuteurs + compte rendu exécutif
+curl -X POST http://localhost:8000/api/v1/transcribe/diarize \
+  -F "file=@reunion.mp4" \
+  -F "num_speakers=3" \
+  -F "enable_meeting_minutes=true" \
+  -F "meeting_minutes_format=executif"
+
+# 3. Sous-titres SRT
+curl -X POST http://localhost:8000/api/v1/transcribe/srt \
+  -F "file=@reunion.mp4"
+
+# 4. Suivre le statut
 curl http://localhost:8000/api/v1/status/abc-123
 
-# Annuler
-curl -X POST http://localhost:8000/api/v1/cancel/abc-123
-
-# Télécharger
+# 5. Télécharger le résultat
 curl -o result.docx http://localhost:8000/api/v1/download/abc-123/docx
+
+# 6. Annuler et nettoyer
+curl -X POST http://localhost:8000/api/v1/cancel/abc-123
+curl -X DELETE http://localhost:8000/api/v1/job/abc-123
 ```
 
 ---
 
 ## Déploiement Docker — mode stateless
 
-Pour un déploiement sans persistance inter-containers, activer le mode stateless :
+Pour un déploiement sans persistance inter-containers, passer en production — qui implique automatiquement le mode stateless :
 
 ```dockerfile
-ENV APP_STATELESS=true
 ENV APP_ENV=production
 ```
 
@@ -381,18 +396,18 @@ docker build -t diarization-app .
 
 # Streamlit
 docker run -p 8501:8501 --gpus all \
-  -e APP_STATELESS=true \
+  -e APP_ENV=production \
   -v $(pwd)/.env:/app/.env \
   -v $(pwd)/model_storage:/app/model_storage \
   diarization-app
 
 # API REST
 docker run -p 8000:8000 --gpus all \
-  -e APP_STATELESS=true \
+  -e APP_ENV=production \
   -v $(pwd)/.env:/app/.env \
   -v $(pwd)/model_storage:/app/model_storage \
   diarization-app \
-  python run.py --serve --port 8000
+  uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
 ---
@@ -464,6 +479,19 @@ DOCX avec locuteurs identifiés, timestamps, mise en forme. Les noms réels remp
 
 `re_export_docx_with_labels()` permet de régénérer le DOCX **après** le pipeline avec de nouveaux labels ou des fusions appliquées.
 
+**Nettoyage regex à l'export** (`clean_before_export` dans [src/exporter.py](src/exporter.py)) — appliqué sur chaque segment avant écriture :
+
+| Catégorie | Avant | Après |
+|-----------|-------|-------|
+| Point entre deux minuscules | `de.souligner` / `lui-même.en` | `de souligner` / `lui-même en` |
+| Ponctuation parasite avant conjonction | `exister. et là aussi` / `organisé ? et` | `exister et là aussi` / `organisé et` |
+| Préposition collée à un mot | `deCommunication` | `de communication` |
+| Acronyme XAR | `XAR` / `xar` | `CSAR` |
+| Acronyme XAM | `XAM` / `xam` | `CSAM` |
+| Acronyme ADG FIP | `ADG FIP` | `DGFIP` |
+| Loi Rixain | `la loi d'ITRIX 1` | `la loi dite Rixain` |
+| Autres | `XYLO`, `AGRAF`, `DTNUM` | normalisés |
+
 ### 8. Compte rendu de réunion
 
 6 formats disponibles :
@@ -503,7 +531,7 @@ Sauvegardé en **JSON** et **Markdown**. Contrôlé par `APP_ENABLE_MEETING_MINU
 ### 12. Cache intelligent + mode stateless
 
 - `saved_state/.config_hash` stocke le hash des paramètres qui affectent le pipeline (`segment_duration`, `llm_model`, etc.). Si le hash change, tous les pickles sont invalidés automatiquement — fini les résultats stale après un changement de config.
-- Mode `APP_STATELESS=true` : désactive entièrement le cache, force le cleanup, experiments dans `tmp/` — adapté au déploiement Docker.
+- Mode stateless (`APP_ENV=production`) : désactive entièrement le cache, force le cleanup, experiments dans `tmp/` — adapté au déploiement Docker.
 
 ### 13. Types d'erreurs spécialisés
 
@@ -582,8 +610,7 @@ diarization_application/
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `APP_ENV` | `development` | `development` / `production` |
-| `APP_STATELESS` | `false` | Mode stateless Docker |
+| `APP_ENV` | `development` | `development` / `production` (production ⇒ stateless auto) |
 | `ROOT` | `.` | Racine des données |
 | `EXPERIMENTS_ROOT` | `./experiments` (ou tmp en stateless) | Dossier de sortie |
 | `INPUT_AUDIO` | — | Liste JSON des fichiers |
@@ -594,7 +621,7 @@ diarization_application/
 | `APP_VAD_FILTER` | `true` | Filtre VAD |
 | `HF_TOKEN` | — | Token HuggingFace |
 | `SERVER_URL` | — | URL Whisper (`/v1`) |
-| `WHISPER_MODEL` | `whisper` | Modèle Whisper |
+| `WHISPER_MODEL` | `whisper` | Modèle Whisper (ex. `cohere-transcribe` — le `prompt` et les timestamps fins sont alors automatiquement omis) |
 | `API_KEY` | — | Clé API serveur |
 | `LLM_MODEL` | — | Modèle LLM |
 | `LLM_BASE_URL` | — | URL LLM (`/v1`) |

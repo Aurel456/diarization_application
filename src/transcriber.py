@@ -58,11 +58,15 @@ def _send_transcription_request(
             logging.error('check if whisper is correctly deployed and that the model name match')
             return None
 
-        reponse_client = client_PIA.audio.transcriptions.create(
-            model=whisper_model,
-            prompt = prompt if prompt else "Tu es spécialisé dans la transcription du Français.",
-            file=audio_file
-        )
+        create_kwargs = {
+            "model": whisper_model,
+            "file": audio_file,
+        }
+        # cohere-transcribe and similar non-Whisper endpoints reject the
+        # `prompt` parameter — only include it for real Whisper-compatible models.
+        if "cohere" not in whisper_model.lower():
+            create_kwargs["prompt"] = prompt if prompt else "Tu es spécialisé dans la transcription du Français."
+        reponse_client = client_PIA.audio.transcriptions.create(**create_kwargs)
         logging.debug(f"Transcription received: '{reponse_client.text[:50]}...'")
         return reponse_client.text
     
