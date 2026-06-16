@@ -59,6 +59,18 @@ def clean_before_export(text: Any) -> str:
     # Artefacts structurels Cohere
     # Point entre deux minuscules : "de.souligner" → "de souligner"
     res = re.sub(r"(?<=[a-zéèêëàâùûüïîôçœæ])\.(?=[a-zéèêëàâùûüïîôçœæ])", " ", res)
+    # Fausse fin de phrase — mot normal : "partagés.Le RSU" → "partagés, le RSU"
+    res = re.sub(
+        r"(?<=[a-zéèêëàâùûüïîôçœæ])\.([A-ZÉÈÊËÀÂÙÛÜÏÎÔÇ][a-zéèêëàâùûüïîôçœæ])",
+        lambda m: ", " + m.group(1).lower(),
+        res,
+    )
+    # Fausse fin de phrase — acronyme : "partagés.RSU" → "partagés, RSU"
+    res = re.sub(
+        r"(?<=[a-zéèêëàâùûüïîôçœæ])\.([A-ZÉÈÊËÀÂÙÛÜÏÎÔÇ]{2,})\b",
+        lambda m: ", " + m.group(1),
+        res,
+    )
     # Ponctuation parasite avant conjonction : "exister. et" / "organisé ? et" → "exister et"
     res = re.sub(r"\s*[.?!]\s+(et|ou|mais|donc|or|ni|car)\b", r" \1", res)
     # Préposition/article collé à un mot : "deCommunication" → "de communication"
